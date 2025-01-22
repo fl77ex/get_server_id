@@ -3,6 +3,7 @@ import paramiko
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor
 
 # Загрузка настроек из .env
 load_dotenv()
@@ -30,7 +31,6 @@ def get_machine_id(ip, password):
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect(ip, username="root", password=password)
-
         stdin, stdout, stderr = ssh.exec_command("cat /etc/machine-id")
         machine_id = stdout.read().decode().strip()
         ssh.close()
@@ -39,35 +39,41 @@ def get_machine_id(ip, password):
         print(f"Ошибка подключения к серверу {ip}: {e}")
         return None
 
+def process_row(row_idx, ip, password):
+    """Обработать строку и вернуть результат"""
+    if ip and password:
+        print(f"Обработка сервера: {ip}")
+        machine_id = get_machine_id(ip, password)
+        if machine_id:
+            print(f"ID получен: {machine_id}")
+            return row_idx, machine_id
+        else:
+            print(f"Не удалось получить ID для {ip}")
+    return None
+
 def update_sheet():
     """Обновить Google Sheet с machine-id"""
     start_row = int(input("С какой строки начать обработку? "))
     records = worksheet.get_all_values()
-    updates = []
 
-    for row_idx, row in enumerate(records, start=1):
-        if row_idx < start_row:  # Пропуск строк до указанной
-            continue
+    tasks = []
+    with ThreadPoolExecutor(max_workers=10) as executor:  # Используем до 10 потоков
+        for row_idx, row in enumerate(records, start=1):
+            if row_idx < start_row:
+                continue
+            ip = row[IP_COLUMN - 1] if len(row) >= IP_COLUMN else None
+            password = row[PASS_COLUMN - 1] if len(row) >= PASS_COLUMN else None
+            existing_id = row[ID_COLUMN - 1] if len(row) >= ID_COLUMN else None
+            if ip and password and not existing_id:
+                tasks.append(executor.submit(process_row, row_idx, ip, password))
 
-        ip = row[IP_COLUMN - 1] if len(row) >= IP_COLUMN else None
-        password = row[PASS_COLUMN - 1] if len(row) >= PASS_COLUMN else None
-        existing_id = row[ID_COLUMN - 1] if len(row) >= ID_COLUMN else None
-
-        if ip and password and not existing_id:
-            print(f"Обработка сервера: {ip}")
-            machine_id = get_machine_id(ip, password)
-
-            if machine_id:
-                updates.append((row_idx, ID_COLUMN, machine_id))
-                print(machine_id)
-            else:
-                print(f"Не удалось получить ID сервера {ip}")
+        updates = [task.result() for task in tasks if task.result()]
 
     if updates:
+        # Обновляем ячейки за один запрос
         cells = worksheet.range(start_row, ID_COLUMN, len(records), ID_COLUMN)
-        for update, cell in zip(updates, cells):
-            row_idx, col_idx, value = update
-            cell.value = value
+        for row_idx, machine_id in updates:
+            cells[row_idx - start_row].value = machine_id
         worksheet.update_cells(cells)
 
 if __name__ == "__main__":
